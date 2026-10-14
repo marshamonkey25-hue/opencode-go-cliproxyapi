@@ -919,6 +919,153 @@ func TestResponsesToChatReasoningAttachmentRules(t *testing.T) {
 	})
 }
 
+// One Responses assistant turn can hold both an assistant text message and
+// tool calls; it reaches the upstream as two Chat Completions messages, and
+// the message that carries the tool calls needs the turn's replayed reasoning
+// too, not only the text message in front of it. Other families keep the wire
+// shape of earlier releases either way.
+func TestResponsesToChatReplaysReasoningOnSplitToolTurn(t *testing.T) {
+	const body = `{"model":"x","stream":true,"input":[
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
+		{"type":"reasoning","id":"rs1","summary":[],"content":[{"type":"reasoning_text","text":"plan A"}]},
+		{"type":"message","role":"assistant","content":[{"type":"output_text","text":"reading first"}]},
+		{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"},
+		{"type":"function_call","call_id":"c2","name":"g","arguments":"{}"},
+		{"type":"function_call_output","call_id":"c1","output":"ok"}
+	]}`
+	for _, tc := range []struct {
+		model string
+		want  string
+	}{
+		{"deepseek-v4.1-flash", "plan A"},
+		{"glm-5.3", ""},
+	} {
+		t.Run(tc.model, func(t *testing.T) {
+			m := mustBuildModel(t, tc.model, "openai-response", body, nil)
+			msgs := m["messages"].([]any)
+			if len(msgs) != 4 {
+				t.Fatalf("messages = %v", msgs)
+			}
+			text := msgs[1].(map[string]any)
+			if text["role"] != "assistant" || text["content"] != "reading first" {
+				t.Fatalf("text message = %v", text)
+			}
+			calls := msgs[2].(map[string]any)
+			if calls["role"] != "assistant" || len(calls["tool_calls"].([]any)) != 2 {
+				t.Fatalf("tool-call message = %v", calls)
+			}
+			if got, ok := reasoningOf(text); got != tc.want || ok != (tc.want != "") {
+				t.Fatalf("text message reasoning_content = %q (present %v), want %q", got, ok, tc.want)
+			}
+			if got, ok := reasoningOf(calls); got != tc.want || ok != (tc.want != "") {
+				t.Fatalf("tool-call message reasoning_content = %q (present %v), want %q", got, ok, tc.want)
+			}
+			if got, ok := reasoningOf(msgs[3].(map[string]any)); ok {
+				t.Fatalf("reasoning leaked into the tool result: %q", got)
+			}
+		})
+	}
+}
+
+// Fresh reasoning that arrives between two tool calls belongs to the tool call
+// that follows it, so it must not be shadowed by the reasoning a previous
+// message of the same turn already carries.
+func TestResponsesToChatReplaysFreshReasoningBetweenToolCalls(t *testing.T) {
+	m := mustBuildModel(t, "deepseek-v4-pro", "openai-response", `{"model":"x","input":[
+		{"type":"reasoning","id":"r1","summary":[],"content":[{"type":"reasoning_text","text":"plan A"}]},
+		{"type":"message","role":"assistant","content":[{"type":"output_text","text":"starting"}]},
+		{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"},
+		{"type":"reasoning","id":"r2","summary":[],"content":[{"type":"reasoning_text","text":"plan B"}]},
+		{"type":"function_call","call_id":"c2","name":"g","arguments":"{}"},
+		{"type":"function_call_output","call_id":"c1","output":"ok"},
+		{"type":"function_call_output","call_id":"c2","output":"ok"}
+	]}`, nil)
+	msgs := m["messages"].([]any)
+	if len(msgs) != 5 {
+		t.Fatalf("messages = %v", msgs)
+	}
+	for i, want := range []string{"plan A", "plan A", "plan B", "", ""} {
+		got, ok := reasoningOf(msgs[i].(map[string]any))
+		if got != want || ok != (want != "") {
+			t.Fatalf("messages[%d] reasoning_content = %q (present %v), want %q: %v", i, got, ok, want, msgs[i])
+		}
+	}
+}
+
+// The replayed reasoning belongs to the assistant output that immediately
+// follows it: a turn boundary drops it instead of carrying it into the next
+// turn, while a fresh reasoning item opens a new turn.
+func TestResponsesToChatReasoningStopsAtTurnBoundary(t *testing.T) {
+	t.Run("system message and tool result", func(t *testing.T) {
+		m := mustBuildModel(t, "deepseek-v4-pro", "openai-response", `{"model":"x","input":[
+			{"type":"reasoning","id":"r1","summary":[],"content":[{"type":"reasoning_text","text":"plan A"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"first"}]},
+			{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"},
+			{"type":"function_call_output","call_id":"c1","output":"ok"},
+			{"type":"message","role":"system","content":[{"type":"input_text","text":"new instructions"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"second"}]},
+			{"type":"function_call","call_id":"c2","name":"g","arguments":"{}"},
+			{"type":"function_call_output","call_id":"c2","output":"ok"},
+			{"type":"reasoning","id":"r2","summary":[],"content":[{"type":"reasoning_text","text":"plan B"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"third"}]}
+		]}`, nil)
+		msgs := m["messages"].([]any)
+		if len(msgs) != 8 {
+			t.Fatalf("messages = %v", msgs)
+		}
+		for i, want := range []string{"plan A", "plan A", "", "", "", "", "", "plan B"} {
+			got, ok := reasoningOf(msgs[i].(map[string]any))
+			if got != want || ok != (want != "") {
+				t.Fatalf("messages[%d] reasoning_content = %q (present %v), want %q: %v", i, got, ok, want, msgs[i])
+			}
+		}
+	})
+
+	t.Run("second assistant message", func(t *testing.T) {
+		m := mustBuildModel(t, "deepseek-v4-pro", "openai-response", `{"model":"x","input":[
+			{"type":"reasoning","id":"r1","summary":[],"content":[{"type":"reasoning_text","text":"plan A"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"first"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"second"}]},
+			{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"}
+		]}`, nil)
+		msgs := m["messages"].([]any)
+		if len(msgs) != 3 {
+			t.Fatalf("messages = %v", msgs)
+		}
+		for i, want := range []string{"plan A", "", ""} {
+			got, ok := reasoningOf(msgs[i].(map[string]any))
+			if got != want || ok != (want != "") {
+				t.Fatalf("messages[%d] reasoning_content = %q (present %v), want %q: %v", i, got, ok, want, msgs[i])
+			}
+		}
+	})
+	// A system or developer message between the replayed reasoning and the
+	// assistant output it would attach to is a turn boundary of its own.
+	t.Run("system message directly after reasoning", func(t *testing.T) {
+		for _, role := range []string{"system", "developer"} {
+			m := mustBuildModel(t, "deepseek-v4-pro", "openai-response", `{"model":"x","input":[
+				{"type":"reasoning","id":"r1","summary":[],"content":[{"type":"reasoning_text","text":"plan A"}]},
+				{"type":"message","role":"`+role+`","content":[{"type":"input_text","text":"instructions"}]},
+				{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]}
+			]}`, nil)
+			for i, msg := range m["messages"].([]any) {
+				if got, ok := reasoningOf(msg.(map[string]any)); got != "" || ok {
+					t.Fatalf("%s: messages[%d] reasoning_content = %q (present %v): %v", role, i, got, ok, msg)
+				}
+			}
+		}
+	})
+}
+
+// reasoningOf reports the replayed chain of thought and whether the wire body
+// carries the field at all: an explicit null or a non-string value is a
+// presence the tests have to catch, not an absence.
+func reasoningOf(msg map[string]any) (string, bool) {
+	raw, ok := msg["reasoning_content"]
+	text, _ := raw.(string)
+	return text, ok
+}
+
 // Anthropic thinking blocks map to reasoning_content (their Chat Completions
 // carrier); redacted_thinking stays omitted since it is encrypted metadata.
 func TestClaudeToChatReplaysThinkingAsReasoningContent(t *testing.T) {
