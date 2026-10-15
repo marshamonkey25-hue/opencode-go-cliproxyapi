@@ -2,12 +2,12 @@
 
 ### Fix
 
-- Attach the replayed chain of thought to the tool-call message of its own turn as well. A Responses assistant turn that holds both an assistant text message and tool calls reaches the upstream as two Chat Completions messages, and the replay used to stop at the first one: the message carrying `tool_calls` went out without `reasoning_content`, the shape a DeepSeek endpoint rejects with HTTP 400 `The reasoning_content in the thinking mode must be passed back to the API.`
+- Attach the replayed chain of thought to every assistant message of its own turn. A Responses assistant turn can span several Chat Completions messages — one per assistant text message, plus the tool-call message that carries the calls — and the replay used to stop at the first one, so the message carrying `tool_calls` went out without `reasoning_content`: the shape a DeepSeek endpoint rejects with HTTP 400 `The reasoning_content in the thinking mode must be passed back to the API.` The turn's reasoning is dropped at a turn boundary (a user, system or developer message, or the tool result that closes the turn), and a fresh reasoning item opens a new assistant output whose calls carry the new chain of thought in their own message.
 - The replay stays limited to the `deepseek*` family, so every other Chat Completions-routed model keeps the wire shape of earlier releases. The Anthropic Messages route needs no change: one Anthropic turn is already one Chat Completions message.
 
 ### Verification
 
-- `internal/adapter/chatcompletions/request_test.go` covers the split turn for a `deepseek*` model (reasoning on both messages, never on the tool result) and for a non-DeepSeek model (no `reasoning_content` at all).
+- `internal/adapter/chatcompletions/request_test.go` covers a turn that holds text and tool calls in both arrival orders, a text message between two calls, the turn boundaries, the mid-turn reasoning item, and the unchanged tool-call merge shape for a non-replay model.
 
 
 ### Change

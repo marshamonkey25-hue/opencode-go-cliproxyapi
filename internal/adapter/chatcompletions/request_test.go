@@ -995,6 +995,76 @@ func TestResponsesToChatReplaysFreshReasoningBetweenToolCalls(t *testing.T) {
 // The replayed reasoning belongs to the assistant output that immediately
 // follows it: a turn boundary drops it instead of carrying it into the next
 // turn, while a fresh reasoning item opens a new turn.
+// Every assistant message of the turn carries the replayed chain of thought,
+// including the tool-call message, whichever order the text and the calls
+// arrive in.
+func TestResponsesToChatReplaysReasoningOnEveryAssistantMessageOfItsTurn(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want int
+	}{
+		{"text before calls", `{"model":"x","input":[
+			{"type":"reasoning","id":"r1","summary":[],"content":[{"type":"reasoning_text","text":"plan A"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"first"}]},
+			{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"}
+		]}`, 2},
+		// The proxy's own Responses stream conversion assigns output indices in
+		// arrival order, so a Chat Completions upstream that streams
+		// reasoning -> tool -> text -> tool reaches clients in this order.
+		{"text between calls", `{"model":"x","input":[
+			{"type":"reasoning","id":"r1","summary":[],"content":[{"type":"reasoning_text","text":"plan A"}]},
+			{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"mid"}]},
+			{"type":"function_call","call_id":"c2","name":"g","arguments":"{}"}
+		]}`, 3},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := mustBuildModel(t, "deepseek-v4-pro", "openai-response", tc.body, nil)
+			msgs := m["messages"].([]any)
+			if len(msgs) != tc.want {
+				t.Fatalf("messages = %v", msgs)
+			}
+			for i, msg := range msgs {
+				if got, ok := reasoningOf(msg.(map[string]any)); got != "plan A" || !ok {
+					t.Fatalf("messages[%d] reasoning_content = %q (present %v): %v", i, got, ok, msg)
+				}
+			}
+			last := msgs[len(msgs)-1].(map[string]any)
+			if calls, ok := last["tool_calls"].([]any); !ok || len(calls) == 0 {
+				t.Fatalf("last message is not a tool-call message: %v", last)
+			}
+		})
+	}
+}
+
+// An input message that carries no content is dropped, so the calls around it
+// keep merging into one tool-call message: opening the replay state must not
+// change that merge shape, which is what earlier releases produced.
+func TestResponsesToChatKeepsTheToolCallMergeShape(t *testing.T) {
+	const body = `{"model":"x","input":[
+		{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"},
+		{"type":"message","role":"user","content":[]},
+		{"type":"function_call","call_id":"c2","name":"g","arguments":"{}"}
+	]}`
+	for _, model := range []string{"glm-5.3", "deepseek-v4-pro"} {
+		t.Run(model, func(t *testing.T) {
+			m := mustBuildModel(t, model, "openai-response", body, nil)
+			msgs := m["messages"].([]any)
+			if len(msgs) != 1 {
+				t.Fatalf("messages = %v", msgs)
+			}
+			asst := msgs[0].(map[string]any)
+			if calls, ok := asst["tool_calls"].([]any); !ok || len(calls) != 2 {
+				t.Fatalf("tool_calls not merged: %v", asst)
+			}
+			if got, ok := reasoningOf(asst); ok {
+				t.Fatalf("reasoning_content present without a reasoning item: %q", got)
+			}
+		})
+	}
+}
 func TestResponsesToChatReasoningStopsAtTurnBoundary(t *testing.T) {
 	t.Run("system message and tool result", func(t *testing.T) {
 		m := mustBuildModel(t, "deepseek-v4-pro", "openai-response", `{"model":"x","input":[
@@ -1021,24 +1091,6 @@ func TestResponsesToChatReasoningStopsAtTurnBoundary(t *testing.T) {
 		}
 	})
 
-	t.Run("second assistant message", func(t *testing.T) {
-		m := mustBuildModel(t, "deepseek-v4-pro", "openai-response", `{"model":"x","input":[
-			{"type":"reasoning","id":"r1","summary":[],"content":[{"type":"reasoning_text","text":"plan A"}]},
-			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"first"}]},
-			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"second"}]},
-			{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"}
-		]}`, nil)
-		msgs := m["messages"].([]any)
-		if len(msgs) != 3 {
-			t.Fatalf("messages = %v", msgs)
-		}
-		for i, want := range []string{"plan A", "", ""} {
-			got, ok := reasoningOf(msgs[i].(map[string]any))
-			if got != want || ok != (want != "") {
-				t.Fatalf("messages[%d] reasoning_content = %q (present %v), want %q: %v", i, got, ok, want, msgs[i])
-			}
-		}
-	})
 	// A system or developer message between the replayed reasoning and the
 	// assistant output it would attach to is a turn boundary of its own.
 	t.Run("system message directly after reasoning", func(t *testing.T) {
